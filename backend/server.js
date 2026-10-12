@@ -1,10 +1,521 @@
+require('dotenv').config();
+const rateLimit = require("express-rate-limit");
+const mongoose = require("mongoose");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const multer = require("multer");
+const path = require("path");
+const express = require("express");
+const cors = require("cors");
+const dns = require('dns');
 const http = require("http");
+const { Server } = require("socket.io");
 
-const server = http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("Instagram Clone Backend is running!");
+const app = express();
+const fetch = require("node-fetch");
+const getBaseUrl = (req) => {
+  return `${req.protocol}://${req.get("host")}`;
+};
+app.set("trust proxy", 1);
+
+
+// 1. FIXED CORS: Added 'ngrok-skip-browser-warning' to allowed headers
+app.use(cors({
+  origin: true,
+  credentials: true
+}));
+
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Headers", "*");
+  res.header("Access-Control-Allow-Methods", "*");
+  next();
 });
 
-server.listen(5000, () => {
-  console.log("Server running on port 5000");
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ limit: "10mb", extended: true }));
+app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+
+const geminiLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 5,              // max 5 requests per minute
+  message: "Too many requests, please try again later."
+});
+
+// DB connect
+dns.setDefaultResultOrder('ipv4first');
+mongoose.connect(process.env.MONGO_URL)
+.then(() => console.log("DB connected"))
+.catch(err => console.log("DB connection error:", err));
+
+// Schemas
+const UserSchema = new mongoose.Schema({
+  name: { type: String, required: true },
+  email: { type: String, required: true, unique: true },
+  password: { type: String, required: true },
+
+  followers: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
+  following: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }]
+});
+const User = mongoose.model("User", UserSchema);
+
+const PostSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+  caption: String,
+  image: String,
+
+  likes: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
+  comments: [
+  {
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+    text: String,
+    createdAt: { type: Date, default: Date.now }
+  }
+],
+}, { timestamps: true });
+const Post = mongoose.model("Post", PostSchema);
+
+const MessageSchema = new mongoose.Schema({
+  sender: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User"
+  },
+
+  receiver: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User"
+  },
+
+  text: String
+
+}, { timestamps: true });
+
+const Message = mongoose.model("Message", MessageSchema);
+
+// Multer Setup
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, "uploads/"),
+  filename: (req, file, cb) => cb(null, Date.now() + path.extname(file.originalname))
+});
+const upload = multer({ storage });
+
+// Auth Middleware
+const authMiddleware = (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) return res.status(401).send("No token");
+    const token = authHeader.split(" ")[1];
+    // Use fallback secret if .env isn't loaded properly
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret');
+    req.user = { userId: decoded.userId };
+    next();
+  } catch (err) {
+    res.status(401).send("Invalid token");
+  }
+};
+
+// Routes
+app.get("/", (req, res) => res.send("Server is running 🚀"));
+
+app.post("/register", async (req, res) => {
+  try {
+    const { name, email, password } = req.body;
+    const existingUser = await User.findOne({ email });
+    if (existingUser) return res.status(400).send("User already exists");
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const user = new User({ name, email, password: hashedPassword });
+    await user.save();
+    res.send("User registered successfully ✅");
+  } catch (err) { res.status(500).send(err.message); }
+});
+
+app.post("/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const user = await User.findOne({ email });
+    if (!user) return res.status(400).send("User not found");
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) return res.status(400).send("Wrong password");
+    const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET || 'secret', { expiresIn: "1d" });
+    res.send({ token });
+  } catch (err) { res.status(500).send(err.message); }
+});
+
+app.post("/comment", authMiddleware, async (req, res) => {
+  try {
+    const { postId, text } = req.body;
+
+    const post = await Post.findById(postId);
+    if (!post) return res.status(404).send("Post not found");
+
+    post.comments.push({
+      userId: req.user.userId,
+      text,
+    });
+
+    await post.save();
+
+const updatedPost = await Post.findById(postId)
+  .populate("userId", "name")
+  .populate("comments.userId", "name");
+
+io.emit("new-comment", updatedPost);
+res.json(updatedPost);
+  } catch (err) {
+    res.status(500).send(err.message);
+  }
+});
+
+app.get("/profile", authMiddleware, async (req, res) => {
+  const user = await User.findById(req.user.userId)
+    .select("-password")
+    .populate("followers", "name")
+    .populate("following", "name");
+
+  res.send(user);
+});
+
+// ✅ UPDATE PROFILE
+app.put("/update-profile", authMiddleware, async (req, res) => {
+  try {
+    const { name } = req.body;
+
+    const updatedUser = await User.findByIdAndUpdate(
+      req.user.userId,
+      { name },
+      { new: true }
+    ).select("-password");
+
+    res.json(updatedUser);
+    io.emit("profile_updated", updatedUser);
+  } catch (err) {
+    res.status(500).send(err.message);
+  }
+});
+
+// FIXED: Variable naming conflicts and user ID reference
+app.post("/create-post", authMiddleware, upload.single("image"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).send("Image is required");
+
+    const BASE_URL = getBaseUrl(req);  // ✅ dynamic
+
+    const newPost = new Post({
+      caption: req.body.caption,
+      image: `${BASE_URL}/uploads/${req.file.filename}`,
+      userId: req.user.userId
+    });
+
+    await newPost.save();
+
+    const populatedPost = await Post.findById(newPost._id)
+      .populate("userId", "name");
+
+    io.emit("new_post", populatedPost);
+
+    res.json(populatedPost);
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).send(err.message);
+  }
+});
+app.put("/like", authMiddleware, async (req, res) => {
+  try {
+    const { postId } = req.body;
+    const userId = req.user.userId; // 🔥 VERY IMPORTANT
+
+    const post = await Post.findById(postId);
+
+    if (!post) return res.status(404).send("Post not found");
+
+    if (post.likes.includes(userId)) {
+      // unlike
+      post.likes = post.likes.filter(id => id.toString() !== userId);
+    } else {
+      // like
+      post.likes.push(userId);
+    }
+
+    await post.save();
+
+    const updatedPost = await Post.findById(postId).populate("userId", "name");
+
+    io.emit("update-like", updatedPost);
+    res.json(updatedPost);
+
+  } catch (err) {
+    console.log(err);
+    res.status(500).send("Server error");
+  }
+});
+
+// ================= FOLLOW / UNFOLLOW =================
+
+app.put("/follow/:id", authMiddleware, async (req, res) => {
+  try {
+    const currentUserId = req.user.userId;
+    const targetUserId = req.params.id;
+
+    if (currentUserId === targetUserId) {
+      return res.status(400).send("You cannot follow yourself");
+    }
+
+    const currentUser = await User.findById(currentUserId);
+    const targetUser = await User.findById(targetUserId);
+
+    if (!targetUser) return res.status(404).send("User not found");
+
+    const isFollowing = currentUser.following.some(
+  id => id.toString() === targetUserId
+);
+
+    if (isFollowing) {
+      // UNFOLLOW
+      currentUser.following = currentUser.following.filter(
+        id => id.toString() !== targetUserId
+      );
+
+      targetUser.followers = targetUser.followers.filter(
+        id => id.toString() !== currentUserId
+      );
+
+    } else {
+      // FOLLOW
+      currentUser.following.push(targetUserId);
+      targetUser.followers.push(currentUserId);
+    }
+
+    await currentUser.save();
+    await targetUser.save();
+
+    // 🔥 populate both users
+const updatedCurrentUser = await User.findById(currentUserId)
+  .select("-password")
+  .populate("followers", "name")
+  .populate("following", "name");
+
+const updatedTargetUser = await User.findById(targetUserId)
+  .select("-password")
+  .populate("followers", "name")
+  .populate("following", "name");
+
+
+res.json({
+  currentUser: updatedCurrentUser,
+  targetUser: updatedTargetUser,
+  isFollowing: !isFollowing
+});
+
+  } catch (err) {
+    res.status(500).send(err.message);
+  }
+});
+
+// ================= GEMINI ROUTE =================
+
+app.post("/gemini", geminiLimiter, authMiddleware, async (req, res) => {
+  try {
+    const { prompt, image } = req.body;
+    console.log("PROMPT:", prompt);
+console.log("IMAGE EXISTS:", !!image);
+console.log("API KEY:", process.env.GEMINI_KEY ? "YES" : "NO");
+    
+console.log("Using API KEY:", process.env.GEMINI_KEY?.slice(0, 10));
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_KEY}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [
+                { text: prompt },
+                ...(image
+                  ? [{
+                      inlineData: {
+                        mimeType: "image/png",
+                        data: image
+                      }
+                    }]
+                  : [])
+              ],
+            },
+          ],
+        }),
+      }
+    );
+
+    let data;
+try {
+  data = await response.json();
+} catch (err) {
+  const text = await response.text();
+  console.log("Non JSON response:", text);
+  return res.status(500).json({ error: "Invalid Gemini response" });
+}
+
+    if (!response.ok) {
+      console.log("Gemini error:", data);
+      return res.status(500).json(data);
+    }
+
+    res.json(data);
+
+  } catch (err) {
+    console.log("Gemini server error:", err);
+    res.status(500).json({ error: "Gemini failed" });
+  }
+});
+// =================================================
+app.get("/posts", authMiddleware, async (req, res) => {
+  try {
+    const currentUser = await User.findById(req.user.userId);
+
+    // include own posts + following users
+    const allowedUsers = [
+      ...currentUser.following,
+      req.user.userId
+    ];
+
+    const posts = await Post.find({
+      userId: { $in: allowedUsers }
+    })
+      .populate("userId", "name email")
+      .populate("comments.userId", "name")
+      .sort({ createdAt: -1 });
+
+    res.json(posts);
+
+  } catch (err) {
+    res.status(500).send(err.message);
+  }
+});
+
+app.get("/users", authMiddleware, async (req, res) => {
+  try {
+    const currentUser = await User.findById(req.user.userId);
+
+    const users = await User.find({
+      _id: { $nin: [...currentUser.following, req.user.userId] }
+    }).select("name followers following");
+
+    res.json(users);
+
+  } catch (err) {
+    res.status(500).send(err.message);
+  }
+});
+
+app.post("/send-message", authMiddleware, async (req, res) => {
+  try {
+    const { receiverId, text } = req.body;
+
+    const senderId = req.user.userId;
+
+    const sender = await User.findById(senderId);
+    const receiver = await User.findById(receiverId);
+
+    if (!receiver) {
+      return res.status(404).send("User not found");
+    }
+
+    // ✅ BOTH MUST FOLLOW EACH OTHER
+    const senderFollows = sender.following.some(
+      id => id.toString() === receiverId
+    );
+
+    const receiverFollows = receiver.following.some(
+      id => id.toString() === senderId
+    );
+
+    if (!senderFollows || !receiverFollows) {
+      return res.status(403).send("Both users must follow each other");
+    }
+
+    const message = new Message({
+      sender: senderId,
+      receiver: receiverId,
+      text
+    });
+
+    await message.save();
+
+    const populatedMessage = await Message.findById(message._id)
+      .populate("sender", "name")
+      .populate("receiver", "name");
+
+    io.emit("new_message", populatedMessage);
+
+    res.json(populatedMessage);
+
+  } catch (err) {
+    res.status(500).send(err.message);
+  }
+});
+
+app.get("/messages/:userId", authMiddleware, async (req, res) => {
+  try {
+    const currentUser = req.user.userId;
+    const otherUser = req.params.userId;
+
+    const messages = await Message.find({
+      $or: [
+        { sender: currentUser, receiver: otherUser },
+        { sender: otherUser, receiver: currentUser }
+      ]
+    })
+      .populate("sender", "name")
+      .populate("receiver", "name")
+      .sort({ createdAt: 1 });
+
+    res.json(messages);
+
+  } catch (err) {
+    res.status(500).send(err.message);
+  }
+});
+
+
+app.delete("/delete-post/:id", authMiddleware, async (req, res) => {
+  try {
+    const post = await Post.findById(req.params.id);
+    if (!post) return res.status(404).send("Post not found");
+    console.log("Post user:", post.userId.toString());
+    console.log("Request user:", req.user.userId);
+    if (post.userId.toString() !== req.user.userId.toString()) return res.status(403).send("Not allowed");
+    const postId = req.params.id;
+
+await Post.findByIdAndDelete(postId);
+
+// 🔥 SEND REAL-TIME EVENT
+io.emit("delete_post", postId);
+
+res.send("Post deleted successfully 🗑️");
+  } catch (err) { res.status(500).send(err.message); }
+});
+
+const PORT = process.env.PORT || 5000;
+
+const server = http.createServer(app);
+
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+  },
+});
+
+io.on("connection", (socket) => {
+  console.log("User connected:", socket.id);
+
+  socket.on("disconnect", () => {
+    console.log("User disconnected");
+  });
+});
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`Server running on port ${PORT}`);
 });
